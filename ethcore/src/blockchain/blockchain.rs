@@ -35,7 +35,7 @@ use receipt::Receipt;
 use blooms::{BloomGroup, GroupPosition};
 use blockchain::best_block::{BestBlock, BestAncientBlock};
 use blockchain::block_info::{BlockInfo, BlockLocation, BranchBecomingCanonChainData};
-use blockchain::extras::{BlockReceipts, BlockDetails, TransactionAddress, EPOCH_KEY_PREFIX, EpochTransitions, LogGroupKey};
+use blockchain::extras::{BlockReceipts, BlockDetails, TransactionAddress, EPOCH_KEY_PREFIX, EpochTransitions, LogGroupKey, BlockNumberKey};
 use types::blockchain_info::BlockChainInfo;
 use types::tree_route::TreeRoute;
 use blockchain::update::ExtrasUpdate;
@@ -185,13 +185,14 @@ pub struct BlockChain {
 	// All locks must be captured in the order declared here.
 	blooms_config: bc::Config,
 
+	// Stores the last block of the last sequence of blocks. `None` if there are no gaps.
+	// This is calculated on start and only updated when blocks are removed.
+	first_block: RwLock<Option<H256>>,
+
 	best_block: RwLock<BestBlock>,
 	// Stores best block of the first uninterrupted sequence of blocks. `None` if there are no gaps.
 	// Only updated with `insert_unordered_block`.
 	best_ancient_block: RwLock<Option<BestAncientBlock>>,
-	// Stores the last block of the last sequence of blocks. `None` if there are no gaps.
-	// This is calculated on start and does not get updated.
-	first_block: Option<H256>,
 
 	// block cache
 	block_headers: RwLock<HashMap<H256, encoded::Header>>,
@@ -222,7 +223,7 @@ impl BlockProvider for BlockChain {
 	}
 
 	fn first_block(&self) -> Option<H256> {
-		self.first_block.clone()
+		self.first_block.read().clone()
 	}
 
 	fn best_ancient_block(&self) -> Option<H256> {
@@ -465,12 +466,12 @@ impl BlockChain {
 		// 400 is the avarage size of the key
 		let cache_man = CacheManager::new(config.pref_cache_size, config.max_cache_size, 400);
 
-		let mut bc = BlockChain {
+		let bc = BlockChain {
 			blooms_config: bc::Config {
 				levels: LOG_BLOOMS_LEVELS,
 				elements_per_index: LOG_BLOOMS_ELEMENTS_PER_INDEX,
 			},
-			first_block: None,
+			first_block: RwLock::new(None),
 			best_block: RwLock::new(BestBlock {
 				// BestBlock will be overwritten anyway.
 				header: Default::default(),
@@ -553,6 +554,7 @@ impl BlockChain {
 			}
 
 			// binary search for the first block.
+			let mut first_block = bc.first_block.write();
 			match raw_first {
 				None => {
 					let (mut f, mut hash) = (best_block_number, best_block_hash);
@@ -575,11 +577,11 @@ impl BlockChain {
 						let mut batch = db.transaction();
 						batch.put(db::COL_EXTRA, b"first", &hash);
 						db.write(batch).expect("Low level database error.");
-						bc.first_block = Some(hash);
+						*first_block = Some(hash);
 					}
 				},
 				Some(raw_first) => {
-					bc.first_block = Some(H256::from_slice(&raw_first));
+					*first_block = Some(H256::from_slice(&raw_first));
 				},
 			}
 
@@ -944,6 +946,10 @@ impl BlockChain {
 	pub fn delete_block(&self, mut batch: &mut DBTransaction, hash: &H256) {
 		let block = self.block(&hash).expect("Block not found.");
 		let number = block.number();
+		let is_canon = self.block_hash(number) == Some(*hash);
+
+		// Disallow removing the genesis block
+		assert!(number != 0); 
 
 		// Remove ommers and orphaned forks stemming from this block
 		let block_details = self.block_details(&hash).expect("Block not found.");
@@ -953,10 +959,35 @@ impl BlockChain {
 			}
 		}
 
+		// Update first block
+		let next_block_hash = self.block_hash(&number + 1);
+		batch.put(db::COL_EXTRA, b"first", &next_block_hash.expect("Deleting canonical block not supported."));
+		let mut first_block = self.first_block.write();
+		*first_block = next_block_hash;
+
+		// Header
+		batch.delete(db::COL_HEADERS, &hash);
+		let mut write_headers = self.block_headers.write();
+		write_headers.remove(&hash);
+
 		// Body
 		batch.delete(db::COL_BODIES, &hash);
 		let mut write_bodies = self.block_bodies.write();
 		write_bodies.remove(&hash);
+		
+		// Details
+		let block_details_index = hash as &Key<BlockDetails, Target = H264>;
+		batch.delete(db::COL_EXTRA, &block_details_index.key());
+		let mut write_details = self.block_details.write();
+		write_details.remove(&hash);
+
+		// Hash
+		if is_canon {
+			let block_hash_index = &number as &Key<H256, Target = BlockNumberKey>;
+			batch.delete(db::COL_EXTRA, &block_hash_index.key());
+			let mut write_hashes = self.block_hashes.write();
+			write_hashes.remove(&number);
+		}
 
 		// Transactions
 		let mut write_txs = self.transaction_addresses.write();
