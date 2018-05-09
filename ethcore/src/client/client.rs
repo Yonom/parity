@@ -966,7 +966,10 @@ impl Client {
 							if era > 0 { // keep the genesis block intact
 								// delete txs and receipts
 								let chain = self.chain.read();
-								chain.delete_block(&mut batch, &ancient_hash);
+								let traces = chain.delete_block(&mut batch, &ancient_hash);
+								for trace in traces {
+									self.tracedb.read().import(&mut batch, trace);
+								}
 							}
 
 							self.db.read().write_buffered(batch);

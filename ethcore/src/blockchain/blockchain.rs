@@ -47,6 +47,7 @@ use engines::epoch::{Transition as EpochTransition, PendingTransition as Pending
 use rayon::prelude::*;
 use ansi_term::Colour;
 use kvdb::{DBTransaction, KeyValueDB};
+use trace::{ImportRequest, FlatBlockTraces};
 
 const LOG_BLOOMS_LEVELS: usize = 3;
 const LOG_BLOOMS_ELEMENTS_PER_INDEX: usize = 16;
@@ -943,10 +944,11 @@ impl BlockChain {
 		ImportRoute::from(info)
 	}
 
-	pub fn delete_block(&self, mut batch: &mut DBTransaction, hash: &H256) {
+	pub fn delete_block(&self, mut batch: &mut DBTransaction, hash: &H256) -> Vec<ImportRequest> {
 		let block = self.block(&hash).expect("Block not found.");
 		let number = block.number();
 		let is_canon = self.block_hash(number) == Some(*hash);
+		let mut trace_updates = Vec::new();
 
 		// Disallow removing the genesis block
 		assert!(number != 0); 
@@ -955,9 +957,22 @@ impl BlockChain {
 		let block_details = self.block_details(&hash).expect("Block not found.");
 		for child_hash in block_details.children {
 			if self.block_hash(number + 1).expect("Next block not found.") != child_hash {
-				self.delete_block(&mut batch, &child_hash);
+				trace_updates.extend(self.delete_block(&mut batch, &child_hash));
 			}
 		}
+
+		// Traces
+		let mut import_request = ImportRequest {
+			traces: FlatBlockTraces::from(Vec::new()), // overwrite with empty hashes
+			block_hash: *hash,
+			block_number: number,
+			enacted: Vec::new(),
+			retracted: 0
+		};
+		if is_canon  {
+			import_request.enacted.push(*hash);
+		}
+		trace_updates.push(import_request);
 
 		// Update first block
 		let next_block_hash = self.block_hash(&number + 1);
@@ -1013,6 +1028,8 @@ impl BlockChain {
 		batch.delete(db::COL_EXTRA, &block_receipts_index.key());
 		let mut write_receipts = self.block_receipts.write();
 		write_receipts.remove(&hash);
+
+		trace_updates
 	}
 
 	/// Get inserted block info which is critical to prepare extras updates.
