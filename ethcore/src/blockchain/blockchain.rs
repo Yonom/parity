@@ -22,7 +22,7 @@ use std::mem;
 use itertools::Itertools;
 use bloomchain as bc;
 use heapsize::HeapSizeOf;
-use ethereum_types::{H256, Bloom, U256};
+use ethereum_types::{H256, Bloom, U256, H264};
 use parking_lot::{Mutex, RwLock};
 use bytes::Bytes;
 use rlp::RlpStream;
@@ -35,12 +35,12 @@ use receipt::Receipt;
 use blooms::{BloomGroup, GroupPosition};
 use blockchain::best_block::{BestBlock, BestAncientBlock};
 use blockchain::block_info::{BlockInfo, BlockLocation, BranchBecomingCanonChainData};
-use blockchain::extras::{BlockReceipts, BlockDetails, TransactionAddress, EPOCH_KEY_PREFIX, EpochTransitions};
+use blockchain::extras::{BlockReceipts, BlockDetails, TransactionAddress, EPOCH_KEY_PREFIX, EpochTransitions, LogGroupKey};
 use types::blockchain_info::BlockChainInfo;
 use types::tree_route::TreeRoute;
 use blockchain::update::ExtrasUpdate;
 use blockchain::{CacheSize, ImportRoute, Config};
-use db::{self, Writable, Readable, CacheUpdatePolicy};
+use db::{self, Writable, Readable, CacheUpdatePolicy, Key};
 use cache_manager::CacheManager;
 use encoded;
 use engines::epoch::{Transition as EpochTransition, PendingTransition as PendingEpochTransition};
@@ -939,6 +939,49 @@ impl BlockChain {
 		}, true);
 
 		ImportRoute::from(info)
+	}
+
+	pub fn delete_block(&self, mut batch: &mut DBTransaction, hash: &H256) {
+		let block = self.block(&hash).expect("Block not found.");
+		let number = block.number();
+
+		// Remove ommers and orphaned forks stemming from this block
+		let block_details = self.block_details(&hash).expect("Block not found.");
+		for child_hash in block_details.children {
+			if self.block_hash(number + 1).expect("Next block not found.") != child_hash {
+				self.delete_block(&mut batch, &child_hash);
+			}
+		}
+
+		// Body
+		batch.delete(db::COL_BODIES, &hash);
+		let mut write_bodies = self.block_bodies.write();
+		write_bodies.remove(&hash);
+
+		// Transactions
+		let mut write_txs = self.transaction_addresses.write();
+		for tx_hash in block.transaction_hashes() {
+			let tx_index = &tx_hash as &Key<TransactionAddress, Target = H264>;
+			batch.delete(db::COL_EXTRA, &tx_index.key());
+			write_txs.remove(&tx_hash);
+		}
+
+		// Blooms
+		let range = number as bc::Number..number as bc::Number;
+		let chain = bc::group::BloomGroupChain::new(self.blooms_config, self);
+		let blooms = chain.replace(&range, Vec::new()).into_iter()
+			.map(|p| From::from(p.0))
+			.collect::<Vec<GroupPosition>>();
+		for key in blooms.iter() {
+			let block_hash_index = key as &Key<BloomGroup, Target = LogGroupKey>;
+			batch.delete(db::COL_EXTRA, &block_hash_index.key());
+		}
+
+		// Receipts
+		let block_receipts_index = hash as &Key<BlockReceipts, Target = H264>;
+		batch.delete(db::COL_EXTRA, &block_receipts_index.key());
+		let mut write_receipts = self.block_receipts.write();
+		write_receipts.remove(&hash);
 	}
 
 	/// Get inserted block info which is critical to prepare extras updates.

@@ -957,11 +957,18 @@ impl Client {
 			if !needs_pruning { break }
 			match state_db.journal_db().earliest_era() {
 				Some(era) if era + self.history <= number => {
-					trace!(target: "client", "Pruning state for ancient era {}", era);
+					trace!(target: "client", "Pruning txs, state and receipts for ancient era {}", era);
 					match chain.block_hash(era) {
 						Some(ancient_hash) => {
 							let mut batch = DBTransaction::new();
 							state_db.mark_canonical(&mut batch, era, &ancient_hash)?;
+
+							if era > 0 { // keep the genesis block intact
+								// delete txs and receipts
+								let chain = self.chain.read();
+								chain.delete_block(&mut batch, &ancient_hash);
+							}
+
 							self.db.read().write_buffered(batch);
 							state_db.journal_db().flush();
 						}
